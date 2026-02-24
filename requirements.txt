@@ -1,0 +1,6 @@
+streamlit==1.40.2
+openai==1.58.1
+matplotlib==3.9.0
+pandas==2.2.2
+numpy
+numpy-financial
