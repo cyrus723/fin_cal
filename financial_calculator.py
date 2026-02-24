@@ -1,6 +1,5 @@
 import streamlit as st
 import numpy as np
-!pip install numpy-financial
 import numpy_financial as npf
 
 # Page config
