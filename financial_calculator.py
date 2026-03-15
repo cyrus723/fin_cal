@@ -2,7 +2,9 @@ import math
 import re
 
 import numpy as np
+import pandas as pd
 import streamlit as st
+import yfinance as yf
 
 # Page config
 st.set_page_config(
@@ -101,11 +103,26 @@ CASH_FLOW_OPTIONS = {
     "Profitability Index (PI)": {"label": "Profitability Index", "prefix": "", "suffix": ""},
 }
 
+BOND_DURATION_OPTIONS = {
+    "Macaulay Duration": {"label": "Macaulay Duration", "prefix": "", "suffix": " years"},
+    "Modified Duration": {"label": "Modified Duration", "prefix": "", "suffix": ""},
+    "Dollar Duration": {"label": "Dollar Duration", "prefix": "$", "suffix": ""},
+    "DV01": {"label": "DV01", "prefix": "$", "suffix": ""},
+    "Convexity": {"label": "Convexity", "prefix": "", "suffix": ""},
+}
+
 SAMPLE_CASH_FLOWS = {
     "Custom": None,
     "Conventional Project": "-10000, 3000, 4200, 6800",
     "Multiple IRRs Example": "-100, 230, -132",
     "Five-Period Expansion": "-50000, 12000, 15000, 18000, 20000, 22000",
+}
+
+PORTFOLIO_LOOKBACK_OPTIONS = {
+    "6 Months": "6mo",
+    "1 Year": "1y",
+    "3 Years": "3y",
+    "5 Years": "5y",
 }
 
 
@@ -297,13 +314,189 @@ def mirr(cash_flows, finance_rate, reinvestment_rate, tol=1e-9):
     return ((future_value_positives / -present_value_negatives) ** (1 / periods)) - 1
 
 
+def bond_cash_flows(face_value, coupon_rate, years_to_maturity, payments_per_year):
+    total_periods = int(round(years_to_maturity * payments_per_year))
+    if total_periods <= 0:
+        raise ValueError("Bond maturity must produce at least one payment period.")
+
+    coupon_payment = face_value * coupon_rate / payments_per_year
+    cash_flows = [coupon_payment] * total_periods
+    cash_flows[-1] += face_value
+    return cash_flows
+
+
+def bond_price(face_value, coupon_rate, yield_rate, years_to_maturity, payments_per_year):
+    cash_flows = bond_cash_flows(face_value, coupon_rate, years_to_maturity, payments_per_year)
+    period_yield = yield_rate / payments_per_year
+    return sum(
+        cash_flow / ((1 + period_yield) ** period)
+        for period, cash_flow in enumerate(cash_flows, start=1)
+    )
+
+
+def bond_durations(face_value, coupon_rate, yield_rate, years_to_maturity, payments_per_year):
+    if payments_per_year <= 0:
+        raise ValueError("Payments per year must be greater than 0.")
+    if years_to_maturity <= 0:
+        raise ValueError("Years to maturity must be greater than 0.")
+    if yield_rate <= -payments_per_year:
+        raise ValueError("Yield is too low for a valid discount rate.")
+
+    cash_flows = bond_cash_flows(face_value, coupon_rate, years_to_maturity, payments_per_year)
+    period_yield = yield_rate / payments_per_year
+    price = bond_price(face_value, coupon_rate, yield_rate, years_to_maturity, payments_per_year)
+
+    if price <= 0:
+        raise ValueError("Bond price must be positive to compute duration.")
+
+    weighted_present_values = 0.0
+    convexity_numerator = 0.0
+    for period, cash_flow in enumerate(cash_flows, start=1):
+        time_years = period / payments_per_year
+        present_value = cash_flow / ((1 + period_yield) ** period)
+        weighted_present_values += time_years * present_value
+        convexity_numerator += cash_flow * period * (period + 1) / ((1 + period_yield) ** (period + 2))
+
+    macaulay_duration = weighted_present_values / price
+    modified_duration = macaulay_duration / (1 + period_yield)
+    dollar_duration = modified_duration * price
+    dv01 = dollar_duration * 0.0001
+    convexity = convexity_numerator / (price * (payments_per_year**2))
+
+    return {
+        "price": price,
+        "macaulay_duration": macaulay_duration,
+        "modified_duration": modified_duration,
+        "dollar_duration": dollar_duration,
+        "dv01": dv01,
+        "convexity": convexity,
+        "coupon_payment": face_value * coupon_rate / payments_per_year,
+        "total_periods": len(cash_flows),
+        "period_yield": period_yield,
+    }
+
+
+def parse_symbols(symbol_inputs):
+    symbols = []
+    for raw_symbol in symbol_inputs:
+        normalized = raw_symbol.strip().upper()
+        if not normalized:
+            continue
+        if normalized in symbols:
+            raise ValueError(f"Duplicate symbol entered: {normalized}")
+        symbols.append(normalized)
+
+    if not symbols:
+        raise ValueError("Enter at least one stock symbol.")
+    if len(symbols) > 5:
+        raise ValueError("Portfolio analysis supports up to five stock symbols.")
+
+    return symbols
+
+
+@st.cache_data(show_spinner=False)
+def fetch_price_history(symbols, lookback_period):
+    price_frames = []
+
+    for symbol in symbols:
+        history = yf.download(
+            symbol,
+            period=lookback_period,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+        if history.empty or "Close" not in history.columns:
+            raise ValueError(f"No price history was returned for {symbol}.")
+
+        closes = history[["Close"]].rename(columns={"Close": symbol})
+        price_frames.append(closes)
+
+    prices = pd.concat(price_frames, axis=1, join="inner").dropna()
+    if prices.shape[0] < 3:
+        raise ValueError("Not enough overlapping price history was available for these symbols.")
+
+    return prices
+
+
+def portfolio_metrics(weights, annual_returns, annual_covariance):
+    portfolio_return = float(weights @ annual_returns)
+    portfolio_variance = float(weights @ annual_covariance @ weights)
+    portfolio_std_dev = math.sqrt(max(portfolio_variance, 0.0))
+    return portfolio_return, portfolio_std_dev
+
+
+def efficient_frontier(annual_returns, annual_covariance, num_points=80):
+    if len(annual_returns) == 1:
+        single_return = float(annual_returns[0])
+        single_std_dev = math.sqrt(max(float(annual_covariance[0][0]), 0.0))
+        return (
+            [{"return": single_return, "volatility": single_std_dev}],
+            np.array([1.0]),
+            single_return,
+            single_std_dev,
+        )
+
+    ones = np.ones(len(annual_returns))
+    inverse_covariance = np.linalg.pinv(annual_covariance)
+
+    a_value = float(ones @ inverse_covariance @ ones)
+    b_value = float(ones @ inverse_covariance @ annual_returns)
+    c_value = float(annual_returns @ inverse_covariance @ annual_returns)
+    delta = a_value * c_value - b_value**2
+
+    if a_value <= 0 or delta <= 1e-12:
+        raise ValueError("Could not build an efficient frontier from this covariance matrix.")
+
+    global_minimum_return = b_value / a_value
+    target_returns = np.linspace(global_minimum_return, max(float(np.max(annual_returns)), global_minimum_return), num_points)
+
+    frontier_points = []
+    for target_return in target_returns:
+        variance = (a_value * target_return**2 - 2 * b_value * target_return + c_value) / delta
+        frontier_points.append(
+            {
+                "return": target_return,
+                "volatility": math.sqrt(max(variance, 0.0)),
+            }
+        )
+
+    gmvp_weights = (inverse_covariance @ ones) / a_value
+    gmvp_return, gmvp_std_dev = portfolio_metrics(gmvp_weights, annual_returns, annual_covariance)
+
+    return frontier_points, gmvp_weights, gmvp_return, gmvp_std_dev
+
+
+def tangency_portfolio(annual_returns, annual_covariance, risk_free_rate):
+    excess_returns = annual_returns - risk_free_rate
+    inverse_covariance = np.linalg.pinv(annual_covariance)
+    raw_weights = inverse_covariance @ excess_returns
+    normalization = float(np.sum(raw_weights))
+
+    if abs(normalization) <= 1e-12:
+        raise ValueError("Could not compute an optimal portfolio from these inputs.")
+
+    optimal_weights = raw_weights / normalization
+    optimal_return, optimal_std_dev = portfolio_metrics(optimal_weights, annual_returns, annual_covariance)
+    sharpe_ratio = (
+        (optimal_return - risk_free_rate) / optimal_std_dev
+        if optimal_std_dev > 0
+        else 0.0
+    )
+    return optimal_weights, optimal_return, optimal_std_dev, sharpe_ratio
+
+
 st.markdown("<h1 style='color:#ffffff; margin-bottom:4px;'>Financial Calculator</h1>", unsafe_allow_html=True)
 st.markdown(
-    "<p style='color:#7eb8f7; margin-bottom:28px;'>Time Value of Money and Cash Flow Analysis</p>",
+    "<p style='color:#7eb8f7; margin-bottom:28px;'>Time Value of Money, Cash Flow Analysis, Bond Duration, and Portfolio Analytics</p>",
     unsafe_allow_html=True,
 )
 
-calculator_mode = st.selectbox("Calculator Mode", ["Time Value of Money", "Cash Flow Analysis"])
+calculator_mode = st.selectbox(
+    "Calculator Mode",
+    ["Time Value of Money", "Cash Flow Analysis", "Bond Duration", "Portfolio Analytics"],
+)
 
 st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
 
@@ -460,7 +653,7 @@ if calculator_mode == "Time Value of Money":
 
         except Exception as exc:
             st.error(f"Calculation error: {exc}")
-else:
+elif calculator_mode == "Cash Flow Analysis":
     solve_for = st.selectbox("Cash Flow Metric", list(CASH_FLOW_OPTIONS.keys()))
 
     col1, col2 = st.columns(2)
@@ -653,9 +846,406 @@ else:
                     )
         except Exception as exc:
             st.error(f"Calculation error: {exc}")
+elif calculator_mode == "Bond Duration":
+    solve_for = st.selectbox("Bond Metric", list(BOND_DURATION_OPTIONS.keys()))
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        face_value = st.number_input(
+            "Face Value",
+            value=1000.0,
+            min_value=0.01,
+            step=100.0,
+            format="%.2f",
+        )
+        coupon_rate_pct = st.number_input(
+            "Annual Coupon Rate (%)",
+            value=5.0,
+            min_value=0.0,
+            step=0.1,
+            format="%.4f",
+        )
+        years_to_maturity = st.number_input(
+            "Years to Maturity",
+            value=10.0,
+            min_value=0.01,
+            step=0.25,
+            format="%.4f",
+        )
+
+    with col2:
+        payment_frequency_label = st.selectbox(
+            "Coupon Frequency",
+            ["Annual", "Semiannual", "Quarterly", "Monthly"],
+            index=1,
+        )
+        payments_per_year = FREQUENCY_OPTIONS[payment_frequency_label]
+
+        yield_mode = st.radio(
+            "Yield Input Type",
+            ["Nominal Annual Yield", "Yield per Period"],
+            horizontal=True,
+        )
+        if yield_mode == "Nominal Annual Yield":
+            annual_yield_pct = st.number_input(
+                "Yield to Maturity (%)",
+                value=4.5,
+                step=0.1,
+                format="%.4f",
+            )
+            yield_rate = annual_yield_pct / 100.0
+        else:
+            period_yield_pct = st.number_input(
+                "Yield per Period (%)",
+                value=2.25,
+                step=0.1,
+                format="%.4f",
+                help=f"Converted to nominal annual yield using {payments_per_year} periods per year.",
+            )
+            yield_rate = (period_yield_pct / 100.0) * payments_per_year
+
+    st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
+
+    if st.button("Analyze Bond", use_container_width=True):
+        try:
+            bond_metrics = bond_durations(
+                face_value=face_value,
+                coupon_rate=coupon_rate_pct / 100.0,
+                yield_rate=yield_rate,
+                years_to_maturity=years_to_maturity,
+                payments_per_year=payments_per_year,
+            )
+            solve_meta = BOND_DURATION_OPTIONS[solve_for]
+
+            result_map = {
+                "Macaulay Duration": bond_metrics["macaulay_duration"],
+                "Modified Duration": bond_metrics["modified_duration"],
+                "Dollar Duration": bond_metrics["dollar_duration"],
+                "DV01": bond_metrics["dv01"],
+                "Convexity": bond_metrics["convexity"],
+            }
+            result = result_map[solve_for]
+
+            st.markdown(
+                f"""
+            <div class='result-box'>
+                <div class='result-label'>{solve_meta["label"]}</div>
+                <div class='result-value'>{format_result(result, prefix=solve_meta["prefix"], suffix=solve_meta["suffix"])}</div>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
+
+            st.caption(
+                " | ".join(
+                    [
+                        f"Bond price: {format_result(bond_metrics['price'], prefix='$')}",
+                        f"Coupon payment: {format_result(bond_metrics['coupon_payment'], prefix='$')}",
+                        f"Coupon frequency: {payment_frequency_label}",
+                        f"Total coupon periods: {bond_metrics['total_periods']}",
+                        f"Yield per period: {bond_metrics['period_yield'] * 100:,.4f}%",
+                        f"Nominal annual yield: {yield_rate * 100:,.4f}%",
+                        f"Modified duration: {bond_metrics['modified_duration']:,.4f}",
+                        f"Convexity: {bond_metrics['convexity']:,.4f}",
+                        f"DV01: {format_result(bond_metrics['dv01'], prefix='$')}",
+                    ]
+                )
+            )
+        except Exception as exc:
+            st.error(f"Calculation error: {exc}")
+else:
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.caption("Enter up to five stock symbols. Blank fields are ignored.")
+        default_symbols = ["AAPL", "MSFT", "GOOGL", "", ""]
+        symbol_inputs = [
+            st.text_input(f"Stock Symbol {index}", value=default_symbols[index - 1], max_chars=10)
+            for index in range(1, 6)
+        ]
+        lookback_label = st.selectbox("Historical Price Window", list(PORTFOLIO_LOOKBACK_OPTIONS.keys()), index=1)
+        lookback_period = PORTFOLIO_LOOKBACK_OPTIONS[lookback_label]
+
+    with col2:
+        try:
+            active_symbols = parse_symbols(symbol_inputs)
+        except ValueError:
+            active_symbols = []
+
+        risk_free_rate_pct = st.number_input(
+            "Risk-Free Rate (%)",
+            value=2.0,
+            step=0.1,
+            format="%.2f",
+            help="Used to identify the maximum Sharpe ratio portfolio.",
+        )
+
+        st.caption("Portfolio weights are normalized automatically if they do not add to 100%.")
+        default_weight = 100.0 / max(len(active_symbols), 1)
+        raw_weights = []
+        for index, symbol in enumerate(active_symbols, start=1):
+            raw_weights.append(
+                st.number_input(
+                    f"{symbol} Weight (%)",
+                    value=default_weight,
+                    min_value=0.0,
+                    step=1.0,
+                    format="%.2f",
+                    key=f"weight_{symbol}_{index}",
+                )
+            )
+
+        if not active_symbols:
+            st.info("Add at least one valid stock symbol to enter portfolio weights.")
+
+    st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
+
+    if st.button("Analyze Portfolio", use_container_width=True):
+        try:
+            symbols = parse_symbols(symbol_inputs)
+            if not raw_weights or len(raw_weights) != len(symbols):
+                raise ValueError("Enter portfolio weights for each selected symbol.")
+
+            weight_vector = np.array(raw_weights, dtype=float)
+            if np.any(weight_vector < 0):
+                raise ValueError("Portfolio weights cannot be negative.")
+            if float(np.sum(weight_vector)) <= 0:
+                raise ValueError("Portfolio weights must sum to more than 0%.")
+
+            normalized_weights = weight_vector / np.sum(weight_vector)
+            prices = fetch_price_history(tuple(symbols), lookback_period)
+            daily_returns = prices.pct_change().dropna()
+
+            annual_returns = daily_returns.mean().to_numpy() * 252
+            annual_covariance = daily_returns.cov().to_numpy() * 252
+            portfolio_return, portfolio_std_dev = portfolio_metrics(
+                normalized_weights,
+                annual_returns,
+                annual_covariance,
+            )
+            risk_free_rate = risk_free_rate_pct / 100.0
+            frontier_points, gmvp_weights, gmvp_return, gmvp_std_dev = efficient_frontier(
+                annual_returns,
+                annual_covariance,
+            )
+            optimal_weights, optimal_return, optimal_std_dev, optimal_sharpe = tangency_portfolio(
+                annual_returns,
+                annual_covariance,
+                risk_free_rate,
+            )
+
+            weights_table = pd.DataFrame(
+                {
+                    "Symbol": symbols,
+                    "Weight (%)": normalized_weights * 100,
+                    "Annualized Return (%)": annual_returns * 100,
+                    "Annualized Volatility (%)": np.sqrt(np.diag(annual_covariance)) * 100,
+                }
+            )
+            correlation_matrix = daily_returns.corr()
+            frontier_df = pd.DataFrame(frontier_points).rename(
+                columns={"return": "Expected Return", "volatility": "Volatility"}
+            )
+            asset_points_df = pd.DataFrame(
+                {
+                    "Label": symbols,
+                    "Volatility": np.sqrt(np.diag(annual_covariance)) * 100,
+                    "Expected Return": annual_returns * 100,
+                    "Series": ["Stock"] * len(symbols),
+                }
+            )
+            frontier_chart_data = frontier_df.copy()
+            frontier_chart_data["Expected Return"] *= 100
+            frontier_chart_data["Volatility"] *= 100
+            frontier_chart_data["Label"] = "Efficient Frontier"
+            frontier_chart_data["Series"] = "Efficient Frontier"
+
+            portfolio_points_df = pd.DataFrame(
+                [
+                    {
+                        "Label": "Your Portfolio",
+                        "Volatility": portfolio_std_dev * 100,
+                        "Expected Return": portfolio_return * 100,
+                        "Series": "Portfolio",
+                    },
+                    {
+                        "Label": "Optimal Portfolio",
+                        "Volatility": optimal_std_dev * 100,
+                        "Expected Return": optimal_return * 100,
+                        "Series": "Optimal",
+                    },
+                    {
+                        "Label": "GMV Portfolio",
+                        "Volatility": gmvp_std_dev * 100,
+                        "Expected Return": gmvp_return * 100,
+                        "Series": "GMV",
+                    },
+                ]
+            )
+
+            st.markdown(
+                f"""
+            <div class='result-box'>
+                <div class='result-label'>Portfolio Return / Standard Deviation</div>
+                <div class='result-value' style='font-size:28px;'>
+                    {portfolio_return * 100:,.2f}% / {portfolio_std_dev * 100:,.2f}%
+                </div>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
+
+            date_start = prices.index.min().date()
+            date_end = prices.index.max().date()
+            st.caption(
+                " | ".join(
+                    [
+                        f"Symbols: {', '.join(symbols)}",
+                        f"History window: {lookback_label}",
+                        f"Observations: {len(daily_returns)} daily returns",
+                        f"Date range: {date_start} to {date_end}",
+                        f"Risk-free rate: {risk_free_rate_pct:,.2f}%",
+                        f"Global minimum variance return: {gmvp_return * 100:,.2f}%",
+                        f"Global minimum variance volatility: {gmvp_std_dev * 100:,.2f}%",
+                    ]
+                )
+            )
+
+            st.subheader("Portfolio Weights and Asset Statistics")
+            st.dataframe(
+                weights_table.style.format(
+                    {
+                        "Weight (%)": "{:,.2f}",
+                        "Annualized Return (%)": "{:,.2f}",
+                        "Annualized Volatility (%)": "{:,.2f}",
+                    }
+                ),
+                use_container_width=True,
+            )
+
+            st.subheader("Correlation Matrix")
+            st.dataframe(correlation_matrix.style.format("{:,.4f}"), use_container_width=True)
+
+            st.subheader("Efficient Frontier")
+            st.vega_lite_chart(
+                {
+                    "layer": [
+                        {
+                            "data": {"values": frontier_chart_data.to_dict("records")},
+                            "mark": {"type": "line", "color": "#7eb8f7", "strokeWidth": 3},
+                            "encoding": {
+                                "x": {"field": "Volatility", "type": "quantitative", "title": "Volatility (%)"},
+                                "y": {
+                                    "field": "Expected Return",
+                                    "type": "quantitative",
+                                    "title": "Expected Return (%)",
+                                },
+                            },
+                        },
+                        {
+                            "data": {"values": asset_points_df.to_dict("records")},
+                            "mark": {"type": "point", "filled": True, "size": 140, "color": "#f6ad55"},
+                            "encoding": {
+                                "x": {"field": "Volatility", "type": "quantitative"},
+                                "y": {"field": "Expected Return", "type": "quantitative"},
+                                "tooltip": [
+                                    {"field": "Label", "type": "nominal", "title": "Asset"},
+                                    {"field": "Expected Return", "type": "quantitative", "format": ".2f"},
+                                    {"field": "Volatility", "type": "quantitative", "format": ".2f"},
+                                ],
+                            },
+                        },
+                        {
+                            "data": {"values": asset_points_df.to_dict("records")},
+                            "mark": {"type": "text", "dy": -12, "color": "#fbd38d", "fontSize": 12},
+                            "encoding": {
+                                "x": {"field": "Volatility", "type": "quantitative"},
+                                "y": {"field": "Expected Return", "type": "quantitative"},
+                                "text": {"field": "Label", "type": "nominal"},
+                            },
+                        },
+                        {
+                            "data": {"values": portfolio_points_df.to_dict("records")},
+                            "mark": {"type": "point", "filled": True, "size": 220},
+                            "encoding": {
+                                "x": {"field": "Volatility", "type": "quantitative"},
+                                "y": {"field": "Expected Return", "type": "quantitative"},
+                                "color": {
+                                    "field": "Series",
+                                    "type": "nominal",
+                                    "scale": {
+                                        "domain": ["Portfolio", "Optimal", "GMV"],
+                                        "range": ["#68d391", "#fc8181", "#63b3ed"],
+                                    },
+                                    "legend": {"title": ""},
+                                },
+                                "shape": {
+                                    "field": "Series",
+                                    "type": "nominal",
+                                    "legend": None,
+                                },
+                                "tooltip": [
+                                    {"field": "Label", "type": "nominal"},
+                                    {"field": "Expected Return", "type": "quantitative", "format": ".2f"},
+                                    {"field": "Volatility", "type": "quantitative", "format": ".2f"},
+                                ],
+                            },
+                        },
+                        {
+                            "data": {"values": portfolio_points_df.to_dict("records")},
+                            "mark": {"type": "text", "dx": 10, "dy": -10, "fontSize": 12, "color": "#ffffff"},
+                            "encoding": {
+                                "x": {"field": "Volatility", "type": "quantitative"},
+                                "y": {"field": "Expected Return", "type": "quantitative"},
+                                "text": {"field": "Label", "type": "nominal"},
+                            },
+                        },
+                    ],
+                    "config": {
+                        "background": "#0f1117",
+                        "axis": {"labelColor": "#e2e8f0", "titleColor": "#e2e8f0", "gridColor": "#2d3748"},
+                        "legend": {"labelColor": "#e2e8f0", "titleColor": "#e2e8f0"},
+                        "view": {"stroke": "#2d3748"},
+                    },
+                },
+                use_container_width=True,
+            )
+            st.caption(
+                "The frontier is an unconstrained Markowitz mean-variance frontier built from annualized historical returns and covariance. The optimal portfolio is the maximum Sharpe ratio portfolio."
+            )
+
+            gmvp_weights_percent = ", ".join(
+                f"{symbol}: {weight * 100:,.2f}%"
+                for symbol, weight in zip(symbols, gmvp_weights)
+            )
+            st.caption(f"Global minimum variance portfolio weights: {gmvp_weights_percent}")
+
+            st.subheader("Optimal Portfolio Weights")
+            optimal_weights_table = pd.DataFrame(
+                {
+                    "Symbol": symbols,
+                    "Optimal Weight (%)": optimal_weights * 100,
+                }
+            )
+            st.dataframe(
+                optimal_weights_table.style.format({"Optimal Weight (%)": "{:,.2f}"}),
+                use_container_width=True,
+            )
+            st.caption(
+                " | ".join(
+                    [
+                        f"Optimal expected return: {optimal_return * 100:,.2f}%",
+                        f"Optimal volatility: {optimal_std_dev * 100:,.2f}%",
+                        f"Optimal Sharpe ratio: {optimal_sharpe:,.4f}",
+                    ]
+                )
+            )
+        except Exception as exc:
+            st.error(f"Calculation error: {exc}")
 
 st.markdown("<br>", unsafe_allow_html=True)
 st.markdown(
-    "<p class='info-text'>Tip: Use negative values for outgoing cash flows such as loan payments or investments. The calculator can solve TVM metrics plus NPV, IRR, MIRR, and PI from ordered cash flow streams.</p>",
+    "<p class='info-text'>Tip: Use negative values for outgoing cash flows such as loan payments or investments. The calculator can solve TVM metrics, cash flow analytics, bond duration measures, and portfolio analytics from free historical stock price data.</p>",
     unsafe_allow_html=True,
 )
